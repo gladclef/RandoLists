@@ -1,11 +1,12 @@
 <?php
 
+require_once(dirname(__FILE__) . "/load_session.php");
+
 $api_key = parse_ini_file("secret.ini");
 $s_api_id = $api_key['client_id'];
 $s_api_secret = $api_key['client_secret'];
-$as_scopes = ['user-library-read', 'playlist-read-collaborative', 'playlist-read-private', 'playlist-modify-private'];
+$as_scopes = ['user-library-read', 'playlist-read-collaborative', 'playlist-read-private', 'playlist-modify-private', 'streaming', 'app-remote-control', 'user-read-currently-playing'];
 
-session_start();
 $b_loggedin = FALSE;
 $s_loginerr = "";
 if (isset($_GET['logout']))
@@ -13,6 +14,9 @@ if (isset($_GET['logout']))
 	unset($_SESSION['access_token']);
 	unset($_SESSION['authcode']);
 	unset($_SESSION['state']);
+	unset($_SESSION['expires_in']);
+	unset($_SESSION['access_acquire_time']);
+	unset($_SESSION['refresh_token']);
 	$_SESSION['show_dialog'] = TRUE; // forces the login prompts to be displayed next time the user tries to log in
 }
 if (!isset($_SESSION['state']))
@@ -21,6 +25,7 @@ if (!isset($_SESSION['state']))
 }
 if (!isset($_SESSION['access_token']))
 {
+	$accessToken = "";
 	if (isset($_GET['error']))
 	{
 		$s_loginerr = "<br /><div style='color:red;'>Error logging in: {$_GET['error']}</div>";
@@ -55,8 +60,12 @@ if (!isset($_SESSION['access_token']))
 			$a_token = json_decode($sb_result, TRUE);
 			if (isset($a_token['access_token']))
 			{
-				$_SESSION['access_token'] = $a_token['access_token'];
-				$b_loggedin = TRUE;
+				$_SESSION['access_token']        = $a_token['access_token'];
+				$_SESSION['expires_in']          = $a_token['expires_in'];
+				$_SESSION['access_acquire_time'] = time();
+				$_SESSION['refresh_token']       = $a_token['refresh_token'];
+				$accessToken                     = $_SESSION['access_token'];
+				$b_loggedin                      = TRUE;
 			}
 			else
 			{
@@ -68,6 +77,14 @@ if (!isset($_SESSION['access_token']))
 else
 {
 	$b_loggedin = TRUE;
+	$accessToken = $_SESSION['access_token'];
+}
+
+$i_expires_in = 0;
+if ($b_loggedin)
+{
+	$i_current = time();
+	$i_expires_in = $_SESSION['expires_in'] - ($i_current - $_SESSION['access_acquire_time']);
 }
 
 ?>
@@ -88,7 +105,52 @@ else
 	</head>
 	<body style="background-image: linear-gradient(to bottom, #77f, #f97); background-repeat: no-repeat; background-color: #f97">
 		<script>
-			window.accessToken = "<?php echo $_SESSION['access_token']; ?>";
+			window.accessToken = "<?php echo $accessToken; ?>";
+			window.refreshToken = "<?php echo $_SESSION['refresh_token']; ?>";
+			window.expires_in = <?php echo $i_expires_in ?>;
+
+			window.refreshAuthorization = function() {
+				var failedToRefresh = function() {
+					clearTimeout(checkRefreshInterval);
+				};
+				$.ajax({
+					url: "https://bbean.us/randolists/refreshAuthToken.php",
+					async: true,
+					cache: false,
+					type: "POST",
+					data: {
+						'do_refresh_authorization': true
+					},
+					timeout: 10000,
+					success: function(response) {
+						if (response == "") {
+							console.log("no response to request to refreshAuthToken");
+							return;
+						}
+						console.log(response);
+						if (response.startsWith("access_token=")) {
+							window.accessToken = response.substring("access_token=".length);
+							expires_in = 3500;
+						} else {
+							failedToRefresh();
+						}
+					},
+					error: function(a,b,c) {
+						console.log(a);
+						console.log(b);
+						console.log(c);
+						failedToRefresh();
+					}
+				});
+			};
+			window.checkRefreshAuthorization = function() {
+				expires_in -= Math.min(20, expires_in);
+				if (expires_in > 40) {
+					return;
+				} else {
+					refreshAuthorization();
+				}
+			};
 
 			window.librarySize = 0;
 			window.userID = "[uid]";
@@ -100,6 +162,10 @@ else
 				{
 					$("body").css('min-height', winheight - 50);
 				}
+				$("#switchScreen").css({
+					'width': $("body").width() + "px",
+					'top': ($("body").height() / 2 - 50) + "px"
+				});
 
 				// make the logout box visible
 				$(".uimage").each(function(k, imgtag) {
@@ -116,6 +182,11 @@ else
 
 				// get the user info
 				<?php echo (($b_loggedin) ? "getUserInfo();" : ""); ?>
+
+				// register the refreshAuthorization callback
+				if (expires_in > 20) {
+					window.checkRefreshInterval = setInterval(checkRefreshAuthorization, 20 * 1000);
+				}
 			});
 
 			window.ajaxErr = function(xhr, ajaxOptions, thrownError, retryFunc, failureCallback) {
@@ -191,7 +262,7 @@ else
 			window.logout = function()
 			{
 				window.location.replace("https://bbean.us/randolists/index.php?logout");
-			}
+			};
 
 			window.getTrack = function(i_idx, successCallback, failureCallback)
 			{
@@ -217,14 +288,85 @@ else
 						successCallback(response.items[0].track);
 					}
 				});
-			}
+			};
+
+			window.getCurrentPlaying = function(successCallback, failureCallback)
+			{
+				var retryFunc = function() {
+					return getTrack(i_idx, successCallback, failureCallback);
+				};
+				$.ajax({
+					url: "https://api.spotify.com/v1/me/player/currently-playing",
+					async: true,
+					cache: false,
+					headers: {
+						'Authorization': 'Bearer ' + accessToken
+					},
+					type: "GET",
+					timeout: 10000,
+					error: function(a,b,c) { ajaxErr(a,b,c,retryFunc,failureCallback); },
+					success: function(response) {
+						if (response !== undefined && response !== null) {
+							successCallback(response);
+						}
+					}
+				});
+			};
+
+			window.drawCurrentlyPlaying = function()
+			{
+				getCurrentPlaying(function(track) {
+					var album = track.item.album;
+					var images = album.images;
+					if (images.length == 0)
+						return;
+					var largestImage = "";
+					var largestWidth = 0;
+					for (var i = 0; i < images.length; i++)
+					{
+						if (images[i].width > largestWidth)
+						{
+							largestWidth = images[i].width;
+							largestImage = images[i].url;
+						}
+					}
+					var jwindow = $(window);
+					var jplayDiv = $("#playerDiv");
+					var jimage = jplayDiv.children("img");
+					jimage.attr("src", largestImage);
+					var widthHeight = Math.min(jwindow.width(), jwindow.height()) - 20;
+					jimage.css({
+						'width': widthHeight + "px",
+						'height': widthHeight + "px"
+					});
+				}, function(a,b,c) {
+					clearTimeout(playerInterval);
+					ajaxErr(a,b,c,null,null);
+				});
+			};
+
+			window.switchScreens = function()
+			{
+				var jrandoDiv = $("#randoListsDiv");
+				var jplayDiv = $("#playerDiv");
+				if (jrandoDiv.css('display') == 'none')
+				{
+					jrandoDiv.show();
+					jplayDiv.hide();
+				}
+				else
+				{
+					jrandoDiv.hide();
+					jplayDiv.show();
+				}
+			};
 
 			window.setProgress = function(text, value, max)
 			{
 				$("#progressStatus").html(text);
 				$("#progressValue").attr("value", value);
 				$("#progressValue").attr("max", max);
-			}
+			};
 
 			window.getLibrarySize = function(successCallback, failureCallback)
 			{
@@ -249,7 +391,7 @@ else
 				};
 				findSize();
 				setProgress("determining library size", 15, 30);
-			}
+			};
 
 			window.getPlaylist = function(s_name, successCallback, failureCallback)
 			{
@@ -292,7 +434,7 @@ else
 					});
 				};
 				getPlaylists();
-			}
+			};
 
 			window.clearPlaylist = function(s_name, s_id, successCallback, failureCallback)
 			{
@@ -356,7 +498,7 @@ else
 					});
 				};
 				getTracks();
-			}
+			};
 
 			window.createPlaylist = function(s_name, successCallback, failureCallback)
 			{
@@ -388,7 +530,7 @@ else
 				};
 				createFunc();
 				setProgress(s_progtext, 15, 30);
-			}
+			};
 
 			window.populatePlaylist = function(s_name, s_id, i_cnt, i_librarySize, successCallback, failureCallback)
 			{
@@ -455,7 +597,7 @@ else
 					}, null);
 				};
 				getSongs();
-			}
+			};
 
 			window.buildPlaylist = function()
 			{
@@ -492,7 +634,7 @@ else
 						}
 					}, failureCallback);
 				}, failureCallback);
-			}
+			};
 		</script>
 
 		<div>
@@ -514,28 +656,46 @@ else
 				</span>
 			</div>
 
-			<div id="loggedin" style="margin: 0 auto; width: 800px; text-align: center;">
-				<h1>Welcome to RandoLists <span class="uname">[uname]</span>!</h1>
-				<div style="width: 200px; height: 220px; margin: 0 auto; position: relative;">
-					<div style="width: 200px; height: 200px; margin: 0 auto; background-position: center; background-repeat: no-repeat; border-radius: 200px; border: 2px solid white; position: absolute; background-color: #555;">
-						<img class="uimage" id="avatar" style="visibility: hidden;" src="" />
-					</div>
-					<div style="width: 200px; height: 125px; background-color: rgba(50, 50, 50, 0.5); position: absolute; left: 2px; top: 2px; border-radius: 200px; text-align: center; padding-top: 75px; font-size: 31px;color: white; display: none; cursor: pointer;" onclick="logout();">Log out</div>
-				</div>
-				<div style="padding-bottom: 5px;">
-					Create a playlist with up to 10,000 random songs from your library:
-				</div>
-				<div>
-					<div style="padding-bottom: 5px;">
-						Playlist Name: <input id="optName" type="text" value="RandoLists" />
-						Size: <input id="optSize" type="number" min="1" max="10000" value="300" />
-						Replace existing: <input id="optReplace" type="checkbox" checked />
-						<input type="button" onclick="buildPlaylist()" value="Go!">
+			<div id="loggedin" style="text-align: center;">
+				<div id="randoListsDiv">
+					<h1>Welcome to RandoLists <span class="uname">[uname]</span>!</h1>
+					<div style="width: 200px; height: 220px; margin: 0 auto; position: relative;">
+						<div style="width: 200px; height: 200px; margin: 0 auto; background-position: center; background-repeat: no-repeat; border-radius: 200px; border: 2px solid white; position: absolute; background-color: #555;">
+							<img class="uimage" id="avatar" style="visibility: hidden;" src="" />
+						</div>
+						<div style="width: 200px; height: 125px; background-color: rgba(50, 50, 50, 0.5); position: absolute; left: 2px; top: 2px; border-radius: 200px; text-align: center; padding-top: 75px; font-size: 31px;color: white; display: none; cursor: pointer;" onclick="logout();">Log out</div>
 					</div>
 					<div style="padding-bottom: 5px;">
-						<span id="progressStatus" style="font-style: italic;">waiting...</span>
-						<progress id="progressValue" value="30" max="30"></progress>
+						Create a playlist with up to 10,000 random songs from your library:
 					</div>
+					<div>
+						<div style="padding-bottom: 5px;">
+							Playlist Name: <input id="optName" type="text" value="RandoLists" />
+							Size: <input id="optSize" type="number" min="1" max="10000" value="300" />
+							Replace existing: <input id="optReplace" type="checkbox" checked />
+							<input type="button" onclick="buildPlaylist()" value="Go!">
+						</div>
+						<div style="padding-bottom: 5px;">
+							<span id="progressStatus" style="font-style: italic;">waiting...</span>
+							<progress id="progressValue" value="30" max="30"></progress>
+						</div>
+					</div>
+				</div>
+				<div id="playerDiv" style="display: none;">
+					<script type="text/javascript">
+						<?php
+							if ($b_loggedin) {
+								echo "window.playerInterval = setInterval(drawCurrentlyPlaying, 5000); drawCurrentlyPlaying();";
+							}
+						?>
+					</script>
+					<img src="">
+				</div>
+			</div>
+
+			<div id="switchScreen" style="display: <?php echo $b_loggedin ? 'inline-block' : 'none'?>; position: absolute; height: 100px; top: 0;">
+				<div style="background-color: rgba(0,0,0,0.5); color: white; height:100px; width:50px; border-bottom-right-radius: 10px; border-top-right-radius: 10px; border:1px solid black; margin-left: -15px; cursor: pointer;" onclick="switchScreens();">
+					<div style="transform: rotate(270deg); width: 84px; margin-top: 40px; margin-left: -20px;">Switch View</div>
 				</div>
 			</div>
 
